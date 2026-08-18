@@ -1,0 +1,69 @@
+"""
+Validation de CrayonV4 : conductivite UO2 non lineaire k(T).
+Compare au cas lineaire (k constant = k(T_surface)) resolu avec
+CrayonV3, pour illustrer l'effet de la decroissance de k avec T.
+"""
+
+import numpy as np
+import matplotlib.pyplot as plt
+
+from crayon_v4 import CrayonV4, k_uo2_nfi
+from crayon_v3 import CrayonV3
+
+alpha_f, R_f, N_f = 6.9e-7, 4.1e-3, 81
+alpha_c, k_c = 6.94e-6, 15.0
+e_gap, e_clad, N_c = 8.0e-5, 5.7e-4, 21
+h_gap, h_conv = 1.0e4, 3.5e4
+T_fluide = 310.0
+dot_q = 3.8e8
+dt = 0.02
+
+crayon = CrayonV4(
+    alpha_f=alpha_f, k_f=k_uo2_nfi, R_f=R_f, N_f=N_f,
+    alpha_c=alpha_c, k_c=k_c, e_gap=e_gap, e_clad=e_clad, N_c=N_c,
+    h_gap=h_gap, h_conv=h_conv, T_fluide=T_fluide, dt=dt,
+    T_init=np.full(N_f + N_c, T_fluide), source_f=dot_q,
+)
+crayon.solve(20000)
+
+print(f"T centre           = {crayon.T[0]:.2f} degC")
+print(f"T surface pastille  = {crayon.T_surface_pastille():.2f} degC")
+print(f"T interne gaine     = {crayon.T_interne_gaine():.2f} degC")
+print(f"T surface gaine     = {crayon.T_surface_gaine():.2f} degC")
+print(f"iterations Picard (min/max/moy) = "
+      f"{min(crayon.iterations_picard)}/{max(crayon.iterations_picard)}/"
+      f"{np.mean(crayon.iterations_picard):.2f}")
+
+P_generee = dot_q * np.pi * R_f**2
+P_sortante = crayon.flux_sortant_frontiere()
+print(f"puissance generee  : {P_generee:.4f} W/m")
+print(f"puissance sortante : {P_sortante:.4f} W/m")
+print(f"ecart bilan relatif: {abs(P_generee - P_sortante) / P_generee:.3e}")
+
+# Comparaison avec v3 (k constant = valeur a T_surface)
+k_surf = k_uo2_nfi(crayon.T_surface_pastille())
+crayon_lin = CrayonV3(
+    alpha_f=alpha_f, k_f=k_surf, R_f=R_f, N_f=N_f,
+    alpha_c=alpha_c, k_c=k_c, e_gap=e_gap, e_clad=e_clad, N_c=N_c,
+    h_gap=h_gap, h_conv=h_conv, T_fluide=T_fluide, dt=dt,
+    T_init=np.full(N_f + N_c, T_fluide), source_f=dot_q,
+)
+crayon_lin.solve(20000)
+print(f"\nk(T_surface) = {k_surf:.3f} W/m/K (reference lineaire)")
+print(f"T centre (k constant = k(T_surf)) = {crayon_lin.T[0]:.2f} degC")
+print(f"T centre (k(T) non lineaire)      = {crayon.T[0]:.2f} degC")
+print("-> le non lineaire doit etre plus chaud (k decroit avec T)")
+
+plt.figure(figsize=(9, 5.5))
+plt.plot(crayon.r * 1e3, crayon.T, 'o', ms=3, color="crimson", label="k(T) non lineaire")
+plt.plot(crayon_lin.r * 1e3, crayon_lin.T, '--', color="steelblue", label="k constant = k(T_surf)")
+plt.axvline(R_f * 1e3, ls=':', color='gray', lw=1)
+plt.axvline((R_f + e_gap) * 1e3, ls=':', color='gray', lw=1)
+plt.xlabel("rayon [mm]")
+plt.ylabel("T [degC]")
+plt.title("Effet de la conductivite non lineaire k_UO2(T)")
+plt.legend()
+plt.grid(alpha=0.3)
+plt.tight_layout()
+plt.savefig("crayon_v4_validation.png", dpi=130)
+plt.show()
