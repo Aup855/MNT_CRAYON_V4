@@ -1,0 +1,273 @@
+"""
+Solveur de conduction thermique dans un crayon combustible avec
+conductivite non lineaire k_f(T) dans la pastille, volumes finis +
+Crank-Nicolson + boucle de Picard.
+
+Reprend l'architecture de CrayonV3 (pastille/jeu/gaine) et remplace la
+conductivite constante de la pastille par une fonction de la
+temperature. Deux correlations sont fournies :
+
+    - k_uo2_fink : Fink (2000), reference IAEA-THPH, valable 773-3120 K.
+                   Conservee pour comparaison, mais sa plage de validite
+                   ne couvre pas la temperature de surface de la
+                   pastille de ce crayon (~707 K) -- un UserWarning est
+                   emis si elle est appelee hors plage.
+    - k_uo2_nfi  : modele NFI modifie (Ohira & Itagaki 1997, modifie par
+                   Lanning et al. 2005), cas non irradie (Bu=0). Valable
+                   500-3000 K, couvre confortablement toute la plage
+                   reellement atteinte par ce crayon -- c'est la
+                   correlation recommandee pour ce cas d'usage.
+
+Ce qui change par rapport a v3 :
+    - la matrice n'est plus construite une seule fois : elle depend de
+      T, donc elle est reconstruite a chaque iteration de Picard, a
+      chaque pas de temps
+    - une boucle de point fixe (Picard) est ajoutee dans step() : on
+      devine T^{n+1}, on en deduit k(T^{n+1}), on resout, on recommence
+      jusqu'a convergence
+    - retrocompatibilite : si k_f est un simple nombre (comme en v3), il
+      est transforme en fonction constante -- le solveur redevient alors
+      identique a v3 (la matrice ne change jamais d'une iteration a
+      l'autre)
+"""
+
+import warnings
+import numpy as np
+from scipy.linalg import solve_banded
+
+
+def k_uo2_fink(T_celsius):
+    """Conductivite thermique de l'UO2 dense [W/(m.K)], correlation de
+    Fink (recommandee IAEA-THPH). T_celsius : scalaire ou tableau, en
+    degC. Valide entre ~500 et ~2847 degC (773-3120 K).
+
+    Emet un UserWarning si appelee hors de cette plage : l'extrapolation
+    n'est alors plus garantie par la litterature."""
+    T_K = np.asarray(T_celsius, dtype=float) + 273.15
+    if np.any(T_K < 773.0) or np.any(T_K > 3120.0):
+        warnings.warn(
+            "k_uo2_fink() appelee hors de sa plage de validite documentee "
+            "(773-3120 K, soit ~500-2847 degC) : valeur extrapolee, non "
+            "garantie par la correlation de Fink (2000). Preferer "
+            "k_uo2_nfi() si la temperature peut descendre sous 500 degC.",
+            UserWarning, stacklevel=2,
+        )
+    return 1.0 / (0.0375 + 2.165e-4 * T_K) + (4.715e9 / T_K**2) * np.exp(-16361.0 / T_K)
+
+
+def k_uo2_nfi(T_celsius):
+    """Conductivite thermique de l'UO2 dense [W/(m.K)], modele NFI
+    modifie (Ohira & Itagaki 1997, modifie par Lanning et al. 2005), cas
+    non irradie (burnup = 0). T_celsius : scalaire ou tableau, en degC.
+    Valide entre ~227 et ~2727 degC (500-3000 K) -- plage plus large que
+    Fink, couvre la totalite du profil de temperature de ce crayon.
+
+    Forme generale avec burnup et gadolinium :
+        k95 = 1/(A + a_gad + B*T + f(Bu) + (1-0.9exp(-0.04Bu))*g(Bu)*h(T))
+              + C/T^2 * exp(-D/T)
+    Ici Bu=0 et a_gad=0 (pas d'irradiation, pas de gadolinium modelises),
+    donc f(Bu)=g(Bu)=0 et la formule se reduit a la forme ci-dessous.
+
+    Source : PNNL-31158 / PNNL-33996 / PNNL-35702 (rapports DOE), memes
+    coefficients dans les 3 rapports (Bu=0)."""
+    T_K = np.asarray(T_celsius, dtype=float) + 273.15
+    if np.any(T_K < 500.0) or np.any(T_K > 3000.0):
+        warnings.warn(
+            "k_uo2_nfi() appelee hors de sa plage de validite documentee "
+            "(500-3000 K, soit ~227-2727 degC).",
+            UserWarning, stacklevel=2,
+        )
+    A, B, C, D = 0.0452, 2.46e-4, 3.5e9, 16361.0
+    return 1.0 / (A + B * T_K) + (C / T_K**2) * np.exp(-D / T_K)
+
+
+class CrayonV4:
+    """CrayonV3 + conductivite pastille k_f(T) non lineaire, resolue par
+    une boucle de Picard a chaque pas de temps."""
+
+    def __init__(self, alpha_f, k_f, R_f, N_f,
+                 alpha_c, k_c, e_gap, e_clad, N_c,
+                 h_gap, h_conv, T_fluide, dt,
+                 T_init=None, source_f=None,
+                 tol_picard=1e-4, max_picard=30):
+        """
+        k_f : soit un scalaire (comportement v3, k constant), soit une
+              fonction T_celsius -> k [W/(m.K)] (comportement v4, ex :
+              k_uo2_fink). Retrocompatibilite automatique.
+        tol_picard : ecart max tolere entre 2 iterations [degC]
+        max_picard  : nombre max d'iterations de Picard par pas de temps
+        """
+        self.k_f_func = (lambda T: np.full_like(np.atleast_1d(np.asarray(T, float)), k_f)) \
+                         if np.isscalar(k_f) else k_f
+        self.k_c = k_c
+        self.rho_cp_c = k_c / alpha_c
+        self.h_gap, self.h_conv = h_gap, h_conv
+        self.T_fluide = T_fluide
+        self.dt = dt
+        self.tol_picard = tol_picard
+        self.max_picard = max_picard
+
+        # Maillages (identiques a v3)
+        self.R_f, self.N_f = R_f, N_f
+        self.dr_f = R_f / (N_f - 1)
+        r_f = np.linspace(0.0, R_f, N_f)
+
+        self.e_gap, self.e_clad, self.N_c = e_gap, e_clad, N_c
+        R_clad_in = R_f + e_gap
+        self.R_clad = R_clad_in + e_clad
+        self.dr_c = e_clad / (N_c - 1)
+        r_c = np.linspace(R_clad_in, self.R_clad, N_c)
+
+        self.r = np.concatenate([r_f, r_c])
+        self.N = N_f + N_c
+
+        # Volumes (identiques a v3)
+        V_f = np.empty(N_f)
+        V_f[0] = np.pi * (0.5 * self.dr_f) ** 2
+        V_f[1:-1] = 2.0 * np.pi * r_f[1:-1] * self.dr_f
+        r_face_last_f = r_f[-1] - 0.5 * self.dr_f
+        V_f[-1] = np.pi * (r_f[-1] ** 2 - r_face_last_f ** 2)
+
+        V_c = np.empty(N_c)
+        r_face_first_c = r_c[0] + 0.5 * self.dr_c
+        V_c[0] = np.pi * (r_face_first_c ** 2 - r_c[0] ** 2)
+        V_c[1:-1] = 2.0 * np.pi * r_c[1:-1] * self.dr_c
+        r_face_last_c = r_c[-1] - 0.5 * self.dr_c
+        V_c[-1] = np.pi * (r_c[-1] ** 2 - r_face_last_c ** 2)
+
+        self.V = np.concatenate([V_f, V_c])
+
+        # rho*cp par noeud : necessite un rho_cp_f meme si k_f varie, on
+        # le derive de alpha_f et d'un k_f "de reference" (a T_fluide)
+        # pour rester coherent avec alpha = k/(rho cp). Hypothese
+        # assumee : rho*cp de la pastille reste constant.
+        k_ref = float(self.k_f_func(np.array([T_fluide]))[0])
+        self.rho_cp_f_const = k_ref / alpha_f
+        self.rho_cp = np.concatenate([
+            np.full(N_f, self.rho_cp_f_const), np.full(N_c, self.rho_cp_c)
+        ])
+
+        # Aires de face (geometrie, inchangee)
+        self.Aface_f = 2.0 * np.pi * (np.arange(N_f - 1) + 0.5) * self.dr_f
+        self.Aface_c = 2.0 * np.pi * (r_c[:-1] + 0.5 * self.dr_c)
+
+        R_gap_moy = R_f + e_gap / 2.0
+        self.A_gap = 2.0 * np.pi * R_gap_moy
+
+        # Portion fixe du tableau aE (jeu + gaine, k_c constant) : ne
+        # depend jamais de T, calculee une seule fois.
+        self._aE_gap = np.array([h_gap * self.A_gap])
+        self._aE_c = k_c * self.Aface_c / self.dr_c
+
+        if source_f is None:
+            source_f_arr = np.zeros(N_f)
+        elif np.isscalar(source_f):
+            source_f_arr = np.full(N_f, float(source_f))
+        else:
+            source_f_arr = np.array(source_f, dtype=float)
+        self.source = np.concatenate([source_f_arr, np.zeros(N_c)])
+
+        self.T = np.full(self.N, T_fluide) if T_init is None else np.array(T_init, float)
+        self.t = 0.0
+        self.historique = [self.T.copy()]
+        self.temps = [0.0]
+        self.iterations_picard = []   # diagnostic : nb d'iterations par pas
+
+    def _build_aE(self, T_fuel_nodes):
+        """Reconstruit le tableau aE complet a partir d'un jeu de
+        temperatures pastille (pour evaluer k_f(T) noeud par noeud). La
+        portion jeu+gaine est fixe, reutilisee telle quelle."""
+        k_nodes = self.k_f_func(T_fuel_nodes)
+        # Conductivite de face = moyenne harmonique des 2 noeuds voisins
+        # (meme logique qu'a une interface entre deux materiaux -- ici,
+        # "deux materiaux" legerement differents car a T differente)
+        k_face_f = 2.0 * k_nodes[:-1] * k_nodes[1:] / (k_nodes[:-1] + k_nodes[1:])
+        aE_f = k_face_f * self.Aface_f / self.dr_f
+        return np.concatenate([aE_f, self._aE_gap, self._aE_c])
+
+    def _construire_matrice(self, aE):
+        """Identique, formule par formule, a v3 -- recoit aE en
+        parametre au lieu de le lire sur self.aE, puisqu'il change a
+        chaque iteration de Picard."""
+        N, dt = self.N, self.dt
+        V, rho_cp = self.V, self.rho_cp
+        ab = np.zeros((3, N))
+
+        aW_arr = aE[:-1]
+        aE_arr = aE[1:]
+        ab[1, 1:-1] = rho_cp[1:-1] * V[1:-1] / dt + 0.5 * (aE_arr + aW_arr)
+        ab[0, 2:] = -0.5 * aE_arr
+        ab[2, :-2] = -0.5 * aW_arr
+
+        ab[1, 0] = rho_cp[0] * V[0] / dt + 0.5 * aE[0]
+        ab[0, 1] = -0.5 * aE[0]
+
+        hA = self.h_conv * 2.0 * np.pi * self.R_clad
+        ab[1, -1] = rho_cp[-1] * V[-1] / dt + 0.5 * (aE[-1] + hA)
+        ab[2, -2] = -0.5 * aE[-1]
+        return ab
+
+    def _second_membre(self, aE_n, T_n):
+        """Partie explicite du bilan (flux + source), evaluee avec les
+        conductances figees a l'instant n (aE_n) -- coherent avec un
+        schema de Crank-Nicolson ou seule la partie implicite (n+1) est
+        re-evaluee au cours des iterations de Picard."""
+        N, dt = self.N, self.dt
+        V, rho_cp = self.V, self.rho_cp
+        b = np.empty(N)
+
+        flux_expl = aE_n[1:] * (T_n[2:] - T_n[1:-1]) - aE_n[:-1] * (T_n[1:-1] - T_n[:-2])
+        b[1:-1] = (rho_cp[1:-1] * V[1:-1] / dt) * T_n[1:-1] + 0.5 * flux_expl \
+                   + self.source[1:-1] * V[1:-1]
+
+        flux_expl0 = aE_n[0] * (T_n[1] - T_n[0])
+        b[0] = (rho_cp[0] * V[0] / dt) * T_n[0] + 0.5 * flux_expl0 + self.source[0] * V[0]
+
+        hA = self.h_conv * 2.0 * np.pi * self.R_clad
+        flux_expl_last = aE_n[-1] * (T_n[-2] - T_n[-1]) - hA * T_n[-1]
+        b[-1] = (rho_cp[-1] * V[-1] / dt) * T_n[-1] + 0.5 * flux_expl_last \
+                 + hA * self.T_fluide + self.source[-1] * V[-1]
+        return b
+
+    def step(self):
+        T_n = self.T.copy()
+
+        # Conductances explicites : figees a l'instant n, calculees une
+        # seule fois pour tout le pas de temps (pas re-iterees).
+        aE_n = self._build_aE(T_n[:self.N_f])
+
+        T_guess = T_n.copy()
+        for it in range(1, self.max_picard + 1):
+            aE_guess = self._build_aE(T_guess[:self.N_f])   # conductances implicites, iterees
+            ab = self._construire_matrice(aE_guess)
+            b = self._second_membre(aE_n, T_n)
+            T_new = solve_banded((1, 1), ab, b)
+
+            residu = np.max(np.abs(T_new - T_guess))
+            T_guess = T_new
+            if residu < self.tol_picard:
+                break
+
+        self.T = T_guess
+        self.t += self.dt
+        self.historique.append(self.T.copy())
+        self.temps.append(self.t)
+        self.iterations_picard.append(it)
+        return self.T
+
+    def solve(self, n_steps):
+        for _ in range(n_steps):
+            self.step()
+        return self.T
+
+    def T_surface_pastille(self):
+        return self.T[self.N_f - 1]
+
+    def T_interne_gaine(self):
+        return self.T[self.N_f]
+
+    def T_surface_gaine(self):
+        return self.T[-1]
+
+    def flux_sortant_frontiere(self):
+        return self.h_conv * 2.0 * np.pi * self.R_clad * (self.T[-1] - self.T_fluide)
