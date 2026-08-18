@@ -1,0 +1,279 @@
+"""
+Suite de tests pour la classe CrayonV4 (conductivite UO2 non lineaire).
+Lancer avec : pytest test_crayon_v4.py -v
+"""
+
+import warnings
+import numpy as np
+import pytest
+from scipy.integrate import quad
+from crayon_v4 import CrayonV4, k_uo2_fink, k_uo2_nfi
+from crayon_v3 import CrayonV3
+
+
+def make_crayon_v4(N_f=41, N_c=11, dt=0.02, k_f=k_uo2_fink,
+                    alpha_f=6.9e-7, R_f=4.1e-3,
+                    alpha_c=6.94e-6, k_c=15.0, e_gap=8.0e-5, e_clad=5.7e-4,
+                    h_gap=1.0e4, h_conv=3.5e4, T_fluide=310.0,
+                    T_init=None, source_f=None, max_picard=30, tol_picard=1e-4):
+    N_tot = N_f + N_c
+    if T_init is None:
+        T_init = np.full(N_tot, T_fluide)
+    return CrayonV4(
+        alpha_f=alpha_f, k_f=k_f, R_f=R_f, N_f=N_f,
+        alpha_c=alpha_c, k_c=k_c, e_gap=e_gap, e_clad=e_clad, N_c=N_c,
+        h_gap=h_gap, h_conv=h_conv, T_fluide=T_fluide, dt=dt,
+        T_init=T_init, source_f=source_f, max_picard=max_picard, tol_picard=tol_picard,
+    )
+
+
+# --- Tests de la correlation k_UO2(T) elle-meme ---
+
+def test_k_uo2_decroit_sur_la_plage_du_crayon():
+    """Sur la plage de temperatures reellement atteintes par ce crayon
+    (~300-1000 degC), k_UO2 doit etre strictement decroissante -- c'est
+    cette decroissance qui pilote tout le raisonnement physique de la
+    v4. Attention : Fink n'est pas monotone sur tout son domaine de
+    validite (elle remonte legerement au-dela de ~1600 degC, effet
+    radiatif reel de l'UO2 proche de la fusion) -- le test est donc
+    volontairement borne a la plage operationnelle du crayon, pas au
+    domaine complet de la correlation."""
+    T = np.linspace(300, 1000, 50)
+    k = k_uo2_fink(T)
+    assert np.all(np.diff(k) < 0)
+
+
+def test_k_uo2_ordre_de_grandeur():
+    """Verifie que la correlation renvoie des valeurs dans la fourchette
+    physique connue de l'UO2 dense (2 a 8 W/(m.K)) -- attrape une erreur
+    de coefficient ou d'unite (ex : T en degC au lieu de Kelvin)."""
+    T = np.linspace(300, 1200, 20)
+    k = k_uo2_fink(T)
+    assert np.all((k > 2.0) & (k < 8.0))
+
+
+# --- Tests de la boucle de Picard ---
+
+def test_picard_converge_sous_la_tolerance():
+    """A chaque pas de temps, le nombre d'iterations de Picard utilise
+    ne doit jamais atteindre le plafond max_picard -- sinon la boucle
+    s'est arretee par epuisement, pas par convergence reelle."""
+    cr = make_crayon_v4(source_f=3.8e8, max_picard=30)
+    cr.solve(500)
+    assert max(cr.iterations_picard) < cr.max_picard
+
+
+def test_picard_peu_d_iterations_necessaires():
+    """En regime quasi stationnaire, la boucle de Picard doit converger
+    en tres peu d'iterations (le point de depart T^n est deja tres
+    proche de T^{n+1}) -- un nombre d'iterations qui explose indiquerait
+    un probleme de convergence ou une sous-relaxation manquante."""
+    cr = make_crayon_v4(source_f=3.8e8)
+    cr.solve(2000)
+    assert np.mean(cr.iterations_picard[-100:]) < 5.0
+
+
+# --- Tests de coherence architecturale (retrocompatibilite v3) ---
+
+def test_k_constant_redonne_v3():
+    """Si k_f est un simple scalaire (comme en v3), CrayonV4 doit
+    reproduire exactement le comportement de CrayonV3 -- le test de
+    non-regression qui garantit que la generalisation en v4 n'a rien
+    casse du comportement v1-v3."""
+    N_f, N_c = 41, 11
+    k_f_const = 3.0
+    params = dict(alpha_f=6.9e-7, R_f=4.1e-3, N_f=N_f,
+                  alpha_c=6.94e-6, k_c=15.0, e_gap=8.0e-5, e_clad=5.7e-4, N_c=N_c,
+                  h_gap=1.0e4, h_conv=3.5e4, T_fluide=310.0, dt=0.02,
+                  source_f=3.8e8)
+
+    cr_v4 = CrayonV4(k_f=k_f_const, T_init=np.full(N_f+N_c, 310.0), **params)
+    cr_v3 = CrayonV3(k_f=k_f_const, T_init=np.full(N_f+N_c, 310.0), **params)
+
+    cr_v4.solve(20000)
+    cr_v3.solve(20000)
+
+    assert np.max(np.abs(cr_v4.T - cr_v3.T)) < 1e-6
+
+
+def test_deux_iterations_suffisent_si_k_constant():
+    """Si k_f ne depend pas de T, la boucle de Picard doit converger en
+    tres peu d'iterations -- mais pas en une seule, et il vaut la peine
+    de comprendre pourquoi. La 1ere iteration calcule T^{n+1} a partir
+    de la temperature de depart T^n (le residu mesure alors l'evolution
+    physique reelle sur le pas de temps, pas une non-linearite -- il
+    n'est donc pas nul). La 2eme iteration recalcule aE a partir de ce
+    nouveau T^{n+1} : comme k ne depend pas de T, aE est identique a la
+    premiere iteration, donc le T^{n+1} recalcule est rigoureusement le
+    meme -- le residu tombe a zero et la boucle s'arrete. Il faut donc
+    exactement 2 passes pour confirmer la convergence, meme sans aucune
+    non-linearite : une pour calculer, une pour verifier qu'il n'y a
+    plus rien a corriger."""
+    cr = CrayonV4(k_f=3.0, alpha_f=6.9e-7, R_f=4.1e-3, N_f=21,
+                  alpha_c=6.94e-6, k_c=15.0, e_gap=8.0e-5, e_clad=5.7e-4, N_c=6,
+                  h_gap=1.0e4, h_conv=3.5e4, T_fluide=310.0, dt=0.02,
+                  T_init=np.full(27, 310.0), source_f=3.8e8)
+    cr.solve(100)
+    assert max(cr.iterations_picard) == 2
+
+
+# --- Tests physiques et de conservation ---
+
+def test_bilan_energie_regime_permanent():
+    """Meme exigence qu'en v3 : la conservation de l'energie doit tenir
+    a travers tout le systeme, y compris avec k(T) non lineaire dans la
+    pastille -- la non-linearite ne doit rien casser a la conservation,
+    qui est une propriete structurelle des volumes finis, independante
+    de la loi materiau utilisee."""
+    dot_q = 3.8e8
+    R_f = 4.1e-3
+    cr = make_crayon_v4(source_f=dot_q)
+    cr.solve(20000)
+
+    P_generee = dot_q * np.pi * R_f**2
+    P_sortante = cr.flux_sortant_frontiere()
+    assert P_sortante == pytest.approx(P_generee, rel=1e-3)
+
+
+def test_centre_plus_chaud_que_reference_lineaire():
+    """Borne rigoureuse (pas seulement empirique) : puisque k_UO2(T) est
+    decroissante sur la plage du crayon, le centre calcule avec k(T)
+    doit etre au moins aussi chaud que si on utilisait un k constant
+    egal a k(T_surface) partout dans la pastille. Demonstration : via la
+    transformation de Kirchhoff Theta(T) = integrale de k, comme
+    k(T') <= k(T_surface) pour tout T' >= T_surface (k decroissante),
+    on a Theta(T)-Theta(T_surf) <= k(T_surface)*(T-T_surf) ; comme
+    Theta(T)-Theta(T_surf) = q'''/4*(Rf^2-r^2) est fixe (independant de
+    la loi k), on en deduit T_nonlineaire(r) >= T_lineaire_k(Tsurf)(r)
+    partout dans la pastille."""
+    N_f, N_c = 61, 16
+    dot_q = 3.8e8
+    cr_nl = make_crayon_v4(N_f=N_f, N_c=N_c, source_f=dot_q)
+    cr_nl.solve(20000)
+
+    k_surf = k_uo2_fink(cr_nl.T_surface_pastille())
+    cr_lin = CrayonV3(alpha_f=6.9e-7, k_f=float(k_surf), R_f=4.1e-3, N_f=N_f,
+                       alpha_c=6.94e-6, k_c=15.0, e_gap=8.0e-5, e_clad=5.7e-4, N_c=N_c,
+                       h_gap=1.0e4, h_conv=3.5e4, T_fluide=310.0, dt=0.02,
+                       T_init=np.full(N_f+N_c, 310.0), source_f=dot_q)
+    cr_lin.solve(20000)
+
+    assert cr_nl.T[0] >= cr_lin.T[0]
+
+
+# --- Validation quantitative : transformation de Kirchhoff ---
+
+def test_validation_kirchhoff():
+    """Le test de validation quantitative de la v4, equivalent du test
+    de la parabole en v1-v3 mais pour une conductivite non lineaire.
+
+    En regime permanent avec source uniforme, la transformation de
+    Kirchhoff Theta(T) = integrale de T_surf a T de k(T') dT' lineairise
+    exactement l'equation de la pastille, quelle que soit la forme de
+    k(T) :
+        Theta(T(r)) - Theta(T_surf) = (q'''/4) * (Rf^2 - r^2)
+    C'est une identite exacte (pas une approximation), valable pour
+    n'importe quelle loi k(T)."""
+    N_f, N_c = 81, 21
+    dot_q = 3.8e8
+    R_f = 4.1e-3
+
+    cr = make_crayon_v4(N_f=N_f, N_c=N_c, source_f=dot_q)
+    cr.solve(20000)
+
+    T_surf = cr.T_surface_pastille()
+
+    def Theta(T):
+        return quad(k_uo2_fink, T_surf, T)[0]
+
+    r_fuel = cr.r[:N_f]
+    T_fuel = cr.T[:N_f]
+
+    lhs = np.array([Theta(T) for T in T_fuel])
+    rhs = (dot_q / 4.0) * (R_f**2 - r_fuel**2)
+
+    assert np.max(np.abs(lhs - rhs)) < 5.0   # tolerance en unites de Theta (W/m)
+
+
+# --- Tests des garde-fous de plage de validite (Fink vs NFI) ---
+
+def test_fink_avertit_hors_plage():
+    """La surface de la pastille de ce crayon (~433.58 degC = 706.7 K)
+    est en dessous de la borne basse de Fink (773 K) : appeler
+    k_uo2_fink() a cette temperature doit emettre un UserWarning --
+    transforme l'angle mort silencieux identifie en une limite
+    explicitement signalee a l'execution."""
+    with pytest.warns(UserWarning, match="hors de sa plage"):
+        k_uo2_fink(433.58)
+
+
+def test_fink_pas_d_avertissement_dans_sa_plage():
+    """A l'inverse, une temperature confortablement dans la plage de
+    Fink (ex : 800 degC = 1073 K) ne doit declencher aucun avertissement
+    -- verifie que le garde-fou ne se declenche pas par erreur (faux
+    positif) sur un usage normal."""
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")   # toute alerte devient une erreur
+        k_uo2_fink(800.0)                # ne doit pas lever d'exception
+
+
+def test_nfi_aucun_avertissement_sur_toute_la_plage_du_crayon():
+    """Le test qui prouve que remplacer Fink par le modele NFI modifie
+    resout reellement le probleme identifie : sur l'ensemble de la plage
+    de temperature atteinte par ce crayon (300 a 1000 degC, centre et
+    surface compris), k_uo2_nfi() ne doit jamais emettre d'avertissement
+    -- contrairement a k_uo2_fink() sur ce meme crayon."""
+    T_plage_crayon = np.linspace(300.0, 1000.0, 50)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        k_uo2_nfi(T_plage_crayon)   # ne doit pas lever d'exception
+
+
+def test_nfi_decroit_sur_la_plage_du_crayon():
+    """Meme exigence que pour Fink (voir test_k_uo2_decroit_sur_la_
+    plage_du_crayon), mais pour le modele NFI -- et sur une plage plus
+    large puisque NFI est valide plus bas (des 227 degC)."""
+    T = np.linspace(250, 1000, 50)
+    k = k_uo2_nfi(T)
+    assert np.all(np.diff(k) < 0)
+
+
+def test_fink_et_nfi_coherents_dans_leur_zone_commune():
+    """Fink et NFI sont deux modeles independants (auteurs, donnees et
+    epoques differentes), mais decrivent la meme grandeur physique. La
+    ou les deux sont valides (773-1200 degC ici, zone commune large),
+    ils doivent rester du meme ordre de grandeur -- un ecart superieur a
+    30% indiquerait une erreur de coefficient dans l'une des deux
+    implementations plutot qu'une simple dispersion inter-modeles (les
+    deux modeles sont documentes a 10-20% d'incertitude experimentale)."""
+    T = np.linspace(550, 1200, 20)
+    k_fink = k_uo2_fink(T)
+    k_nfi = k_uo2_nfi(T)
+    ecart_relatif = np.abs(k_fink - k_nfi) / k_fink
+    assert np.all(ecart_relatif < 0.30)
+
+
+def test_validation_kirchhoff_avec_nfi():
+    """Reprend exactement la methode de test_validation_kirchhoff, mais
+    avec la correlation NFI a la place de Fink -- preuve que la
+    transformation de Kirchhoff valide n'importe quelle loi k(T), pas
+    seulement celle choisie initialement."""
+    N_f, N_c = 81, 21
+    dot_q = 3.8e8
+    R_f = 4.1e-3
+
+    cr = make_crayon_v4(N_f=N_f, N_c=N_c, k_f=k_uo2_nfi, source_f=dot_q)
+    cr.solve(20000)
+
+    T_surf = cr.T_surface_pastille()
+
+    def Theta(T):
+        return quad(k_uo2_nfi, T_surf, T)[0]
+
+    r_fuel = cr.r[:N_f]
+    T_fuel = cr.T[:N_f]
+
+    lhs = np.array([Theta(T) for T in T_fuel])
+    rhs = (dot_q / 4.0) * (R_f**2 - r_fuel**2)
+
+    assert np.max(np.abs(lhs - rhs)) < 5.0
